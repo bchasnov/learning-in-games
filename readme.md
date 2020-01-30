@@ -1,3 +1,5 @@
+## Introduction
+
 A game *G* is defined by a tuple of objectives with a shared domain.
 To solve a game, in some precise sense, is to find (a set of) points 
 that satisfies optimality conditions of each of the objectives **individually**.
@@ -14,7 +16,12 @@ in these settings, in hopes of finding such an 'optimal' solution.
 Various solution concepts arise from different structures imposed on the game. 
 A common baseline concept in these settings are Nash equilibria [2].
 
+Systems with multiple controllers, each running their own optimization algorithm and affecting one another, are best modeled as games. In this repository we present various approaches to modeling these interactions.
+
 
 [1] Fudenberg, Drew, and Levine, David. "The theory of learning in games." MIT press (1998).
 
 [2] Nash, John. "Non-cooperative games." Annals of mathematics (1951)
+
+## Documentation
+
