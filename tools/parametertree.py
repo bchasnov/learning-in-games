@@ -114,7 +114,6 @@ def update_traj(params):
 
     x0 = jnp.array([config_traj['x1'], config_traj['x2']])
     lr = config_traj['learning_rate']
-    print(lr)
     data = scan(lambda *x: lr*g(*x), x0, config_traj['num_iter'])
     line.set_xdata(data[:,0])
     line.set_ydata(data[:,1])
