@@ -4,11 +4,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
+from loaders import load
+import time
+import pandas
+import sys
 
+import os
+from tensorboardX import SummaryWriter
+
+from uuid import uuid4
+
+if int(os.environ.get("NOTEBOOK_MODE", 0)) == 1:
+    from tqdm import tqdm_notebook as tqdm
+else:
+    from tqdm import tqdm as tqdm
 
 class Net(nn.Module):
+    """ default pytorch example """
     def __init__(self):
         super(Net, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
@@ -34,6 +47,7 @@ class Net(nn.Module):
         return output
 
 class Perturb(nn.Module):
+    """ constant perturbation """
     def __init__(self, shape):
         super(Perturb, self).__init__()
         self.delta = nn.Parameter(torch.zeros(shape))
@@ -69,6 +83,9 @@ def config(arg_dict=None):
     parser.add_argument('--perturb_reg', default=1)
     parser.add_argument('--dataset', default='mnist')
     parser.add_argument('--datadir', default='./data')
+    import getpass
+    parser.add_argument('--storedir', default='/mnt/md0/ben/checkpoints/')
+    parser.add_argument('--log_smooth', default=0.2)
 
     args = []
     if arg_dict is not None:
@@ -78,32 +95,6 @@ def config(arg_dict=None):
     args = parser.parse_args([])
     return args
 
-def load(dataset, datadir, batch_size, test_batch_size, **kwargs):
-    if dataset == 'mnist':
-        train_loader = torch.utils.data.DataLoader(
-            datasets.MNIST(datadir, train=True, download=True, 
-                           transform=transforms.Compose([
-                               transforms.ToTensor(),
-                               transforms.Normalize((0.1307,), (0.3081,))
-                           ])),
-            batch_size=batch_size, shuffle=True, drop_last=True, **kwargs)
-        test_loader = torch.utils.data.DataLoader(
-            datasets.MNIST(datadir, train=False, transform=transforms.Compose([
-                               transforms.ToTensor(),
-                               transforms.Normalize((0.1307,), (0.3081,))
-                           ])),
-            batch_size=test_batch_size, shuffle=True, drop_last=True, **kwargs)
-
-    # hack to include the shape of the entire batch
-    for d, _ in train_loader:
-        train_loader.shape = d.shape
-        break
-    for d, _ in test_loader:
-        test_loader.shape = d.shape
-        break
-
-    return (train_loader, test_loader)
-
 def init(args, device, shape):
     model = Net().to(device)
     perturb = Perturb(shape).to(device) 
@@ -111,70 +102,128 @@ def init(args, device, shape):
     opt2 = optim.SGD(perturb.parameters(), lr=args.lr2)
     return (model, perturb), (opt1, opt2)
 
+def loss(model, delta, batch):
+    (data, target) = batch
+    output = model(data + delta)
+    return F.nll_loss(output, target)
 
-def train(args, models, device, train_loader, optimizers, epoch):
-    model,perturb = models
+def train(state, args, models, device, loader, optimizers, logger):
+    model, perturb = models
     model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
+    
+    iterator = tqdm(enumerate(loader), total=len(loader))
+    
+    f1_smooth = 0
+    f2_smooth = 0
+    for batch_idx, (data, target) in iterator:
+        batch = data.to(device), target.to(device)
+        
         optimizers[0].zero_grad()
+        
         delta = perturb()
-        output = model(data+delta)
-        delta.detach()
-        loss = F.nll_loss(output, target)
-        loss.backward()
+        f1 = loss(model, delta, batch)
+        f1.backward()
+        
         optimizers[0].step()
-
         optimizers[1].zero_grad()
+        
         delta = perturb()
-        with torch.no_grad():
-            output = model(data+delta)
-        loss = -F.nll_loss(output, target) + args.perturb_reg*torch.sum(delta*delta)/2
-        loss.backward()
+        perturb_norm = torch.sum(delta*delta)/2
+        f2 = -loss(model, delta, batch) + args.perturb_reg*perturb_norm
+        
+        f2.backward()
+        
         optimizers[1].step()
-
+        
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item()))
+            pass
+#            print('train epoch: {} [{}/{} ({:.0f}%)]\tloss: {:.6f} norm(delta): {}'.format(
+#                epoch, batch_idx * len(data), len(loader.dataset),
+#                100. * batch_idx / len(loader), loss.item(), perturb_norm))
 
-def test(model, device, test_loader):
+        f1_smooth = (1-args.log_smooth)*f1_smooth + args.log_smooth*f1
+        f2_smooth = (1-args.log_smooth)*f2_smooth + args.log_smooth*f2
+       
+        desc = (f'{args.loop_msg} | Loss: {f1_smooth:6.3f},{f2_smooth:6.3f} | norm(delta):{perturb_norm:8.5f} ||')
+
+        logger.append({'iter': state['iter'], 'time_wallclock':time.time()-state['start_time'], 
+                   'loss[0]':f1, 'loss[1]':f2, 'norm(delta)':perturb_norm})
+        iterator.set_description(desc)
+        iterator.refresh()
+
+        state['iter'] += 1
+
+def test(state, model, device, test_loader, logger):
     model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
-        for data, target in test_loader:
+        iterator = tqdm(enumerate(test_loader), total=len(test_loader))
+        for idx, (data, target) in iterator:
             data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
+            desc = (f'Test | Loss: {test_loss:10.3f}, {correct}/{len(test_loader.dataset)}({100*correct/((idx+1)/test_loader.batch_size*len(test_loader.dataset))}%)')
+            iterator.set_description(desc)
+            iterator.refresh()
 
     test_loss /= len(test_loader.dataset)
+    logger.append({'iter': state['iter'], 'test_accuracy': correct/len(test_loader.dataset)})
+   
+class Logger():
+    def __init__(self, writer):
+        self.df = pandas.DataFrame()
+        self.writer = writer
 
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+    def append(self, other):
+        self.df.append(other, ignore_index=True)
+        for arg,val in other.items():
+            self.writer.add_scalar(arg, val, other['iter'])
+    def to_pickle(self, path):
+        self.df.to_pickle(path)
 
-def main(args=None):
+
+def main(args=None, exp_id=None):
+    state = dict(iter=0, start_time=time.time())
     args = config(args)
+
+    # make a new experiment id
+    if not exp_id:
+        exp_id = str(uuid4())
+
+    # try to make the store dir (if it doesn't exist)
+    storefile = os.path.join(args.storedir, exp_id)
+    try:
+        os.makedirs(storefile)
+    except OSError as e:
+        print("Directory exists ({e.message})")
+
+    writer = SummaryWriter(storefile)
+    logger = Logger(writer)
+    with open(os.path.join(storefile, 'argv.pkl'), 'w') as file:
+        file.write(str(sys.argv))
+
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if use_cuda else "cpu")
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
     train_loader, test_loader = load(args.dataset, args.datadir, args.batch_size, args.test_batch_size, **kwargs)
     models, optimizers = init(args, device, shape=train_loader.shape)
-    sched1= StepLR(optimizers[0], step_size=1, gamma=args.gamma1)
-    sched2= StepLR(optimizers[1], step_size=1, gamma=args.gamma2)
+    sched1 = StepLR(optimizers[0], step_size=1, gamma=args.gamma1)
+    sched2 = StepLR(optimizers[1], step_size=1, gamma=args.gamma2)
     schedulers = [sched1, sched2]
     for epoch in range(1, args.epochs + 1):
-        train(args, models, device, train_loader, optimizers, epoch)
-        test(models[0], device, test_loader)
-        scheduler[0].step()
-        scheduler[1].step()
+        args.loop_msg = f'Epoch: {epoch}'
+        train(state, args, models, device, train_loader, optimizers, logger)
+        test(state, models[0], device, test_loader, logger)
+        schedulers[0].step()
+        schedulers[1].step()
+        logger.to_pickle(os.path.join(args.storedir, exp_id, 'store.pkl'))
 
     if args.save_model:
-        torch.save(model.state_dict(), "mnist_cnn.pt")
+        torch.save(model.state_dict(), os.path.join(storefile, "save.pt"))
 
 
 if __name__ == '__main__':
