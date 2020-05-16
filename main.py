@@ -55,50 +55,52 @@ class Perturb(nn.Module):
     def forward(self):
         return self.delta
 
-def config(arg_dict=None):
+def config(**kwargs):
     # Training settings
-    parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
-    parser.add_argument('--batch-size', type=int, default=64, metavar='N',
-                        help='input batch size for training (default: 64)')
-    parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
-                        help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=14, metavar='N',
-                        help='number of epochs to train (default: 14)')
-    parser.add_argument('--lr1', type=float, default=1.0, metavar='LR',
-                        help='learning rate (player 1)')
-    parser.add_argument('--gamma1', type=float, default=0.7, metavar='M',
-                        help='Learning rate step gamma (player 1)')
-    parser.add_argument('--lr2', type=float, default=1.0, metavar='LR',
-                        help='learning rate (player 2)')
-    parser.add_argument('--gamma2', type=float, default=0.7, metavar='M',
-                        help='Learning rate step gamma (player 2)')
-    parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
-    parser.add_argument('--seed', type=int, default=1, metavar='S',
+    parser = argparse.ArgumentParser(description='learning in games')
+    train = parser.add_argument_group('train')
+    test = parser.add_argument_group('test')
+    run = parser.add_argument_group('run')
+    train.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--log-interval', type=int, default=10, metavar='N',
+    train.add_argument('--dataset', default='mnist')
+    train.add_argument('--batch-size', type=int, default=64, metavar='N',
+                        help='input batch size for training (default: 64)')
+    test.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
+                        help='input batch size for testing (default: 1000)')
+    train.add_argument('--epochs', type=int, default=14, metavar='N',
+                        help='number of epochs to train (default: 14)')
+    train.add_argument('--lr1', type=float, default=1.0, metavar='LR',
+                        help='learning rate (player 1)')
+    train.add_argument('--gamma1', type=float, default=0.7, metavar='M',
+                        help='Learning rate step gamma (player 1)')
+    train.add_argument('--lr2', type=float, default=1.0, metavar='LR',
+                        help='learning rate (player 2)')
+    train.add_argument('--gamma2', type=float, default=0.7, metavar='M',
+                        help='Learning rate step gamma (player 2)')
+    train.add_argument('--perturb_reg', type=float, default=0.0)
+    run.add_argument('--no-cuda', action='store_true', default=False,
+                        help='disables CUDA training')
+    run.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
-    parser.add_argument('--save-model', action='store_true', default=False,
+    run.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
-    parser.add_argument('--perturb_reg', default=1)
-    parser.add_argument('--dataset', default='mnist')
-    parser.add_argument('--datadir', default='./data')
-    import getpass
-    parser.add_argument('--storedir', default='/mnt/md0/ben/checkpoints/')
-    parser.add_argument('--log_smooth', default=0.2)
-
-    args = []
-    if arg_dict is not None:
-        for arg,val in arg_dict.items():
-            args += [f'--{arg}={val}']
-    args = parser.parse_args(args)
-    args = parser.parse_args([])
+    run.add_argument('--datadir', default='./data')
+    run.add_argument('--storedir', default='./checkpoints')
+    run.add_argument('--log_smooth', default=0.5)
+    parser.set_defaults(**kwargs)
+    try:
+        if get_ipython().__class__.__name__ == 'ZMQInteractiveShell':
+            args = parser.parse_args('')
+    except:        
+        args = parser.parse_args()
     return args
+
 
 def init(args, device, shape):
     model = Net().to(device)
     perturb = Perturb(shape).to(device) 
-    opt1 = optim.Adadelta(model.parameters(), lr=args.lr1)
+    opt1 = optim.SGD(model.parameters(), lr=args.lr1)
     opt2 = optim.SGD(perturb.parameters(), lr=args.lr2)
     return (model, perturb), (opt1, opt2)
 
@@ -146,8 +148,8 @@ def train(state, args, models, device, loader, optimizers, logger):
        
         desc = (f'{args.loop_msg} | Loss: {f1_smooth:6.3f},{f2_smooth:6.3f} | norm(delta):{perturb_norm:8.5f} ||')
 
-        logger.append({'iter': state['iter'], 'time_wallclock':time.time()-state['start_time'], 
-                   'loss[0]':f1, 'loss[1]':f2, 'norm(delta)':perturb_norm})
+        if batch_idx % args.log_interval == 0:
+            logger.append(state['iter'], {'loss0':f1, 'loss1':f2, 'loss_sum':f1+f2, 'norm_delta':perturb_norm})
         iterator.set_description(desc)
         iterator.refresh()
 
@@ -165,29 +167,29 @@ def test(state, model, device, test_loader, logger):
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
             pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
             correct += pred.eq(target.view_as(pred)).sum().item()
-            desc = (f'Test | Loss: {test_loss:10.3f}, {correct}/{len(test_loader.dataset)}({100*correct/((idx+1)/test_loader.batch_size*len(test_loader.dataset))}%)')
+            desc = (f'Test | Loss: {test_loss:10.3f}, {correct}/{len(test_loader.dataset)}({correct/((idx+1)/test_loader.batch_size*len(test_loader.dataset))}%)')
             iterator.set_description(desc)
             iterator.refresh()
 
     test_loss /= len(test_loader.dataset)
-    logger.append({'iter': state['iter'], 'test_accuracy': correct/len(test_loader.dataset)})
+    logger.append(state['iter'], {'test_accuracy': correct/len(test_loader.dataset)})
    
 class Logger():
     def __init__(self, writer):
         self.df = pandas.DataFrame()
         self.writer = writer
 
-    def append(self, other):
+    def append(self, iter, other):
         self.df.append(other, ignore_index=True)
         for arg,val in other.items():
-            self.writer.add_scalar(arg, val, other['iter'])
+            self.writer.add_scalar(arg, val, iter)
     def to_pickle(self, path):
         self.df.to_pickle(path)
 
 
-def main(args=None, exp_id=None):
+def main(exp_id=None):
     state = dict(iter=0, start_time=time.time())
-    args = config(args)
+    args = config()
 
     # make a new experiment id
     if not exp_id:
@@ -202,8 +204,8 @@ def main(args=None, exp_id=None):
 
     writer = SummaryWriter(storefile)
     logger = Logger(writer)
-    with open(os.path.join(storefile, 'argv.pkl'), 'w') as file:
-        file.write(str(sys.argv))
+    with open(os.path.join(storefile, 'args.txt'), 'w') as file:
+        file.write(str(vars(args)))
 
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
@@ -222,8 +224,8 @@ def main(args=None, exp_id=None):
         schedulers[1].step()
         logger.to_pickle(os.path.join(args.storedir, exp_id, 'store.pkl'))
 
-    if args.save_model:
-        torch.save(model.state_dict(), os.path.join(storefile, "save.pt"))
+        if args.save_model:
+            torch.save(models[0].state_dict(), os.path.join(storefile, "save{epoch:03d}.pt"))
 
 
 if __name__ == '__main__':
