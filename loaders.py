@@ -1,7 +1,13 @@
 import torch
 from torchvision import datasets, transforms
 
-def load(dataset, datadir, batch_size, test_batch_size, **kwargs):
+def load(args): 
+    use_cuda = not args.no_cuda and torch.cuda.is_available()
+    kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    dataset, datadir, batch_size, test_batch_size = args.dataset, args.datadir, args.batch_size, args.test_batch_size
     if dataset == 'mnist':
         train_loader = torch.utils.data.DataLoader(
             datasets.MNIST(datadir, train=True, download=True, 
@@ -25,5 +31,5 @@ def load(dataset, datadir, batch_size, test_batch_size, **kwargs):
         test_loader.shape = d.shape
         break
 
-    return (train_loader, test_loader)
+    return (train_loader, test_loader), device
 

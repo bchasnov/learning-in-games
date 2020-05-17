@@ -9,16 +9,15 @@ from loaders import load
 import time
 import pandas
 import sys
+from ast import literal_eval
+import numpy as np
 
 import os
 from tensorboardX import SummaryWriter
 
 from uuid import uuid4
 
-if int(os.environ.get("NOTEBOOK_MODE", 0)) == 1:
-    from tqdm import tqdm_notebook as tqdm
-else:
-    from tqdm import tqdm as tqdm
+from tqdm.auto import tqdm
 
 class Net(nn.Module):
     """ default pytorch example """
@@ -57,6 +56,19 @@ class Perturb(nn.Module):
 
 def config(**kwargs):
     # Training settings
+    def add_argument(parser, desc, default, help_str, 
+                     arg_type=None, metavar=None, choices=None):
+        """ adds argument to argparse.ArugmentParser """
+        desc = desc.replace("_", '-')
+        if arg_type is None:
+            arg_type = type(default)
+        elif type(arg_type) is list:
+            choices = arg_type
+            arg_type = type(arg_type[0])
+        parser.add_argument('--'+desc, type=arg_type, default=default, metavar=metavar,
+                help=help_str, choices=choices)
+        return parser
+        
     parser = argparse.ArgumentParser(description='learning in games')
     train = parser.add_argument_group('train')
     test = parser.add_argument_group('test')
@@ -83,11 +95,15 @@ def config(**kwargs):
                         help='disables CUDA training')
     run.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
-    run.add_argument('--save-model', action='store_true', default=False,
+    run.add_argument('--save-model', action='store_true', default=True,
                         help='For Saving the current Model')
     run.add_argument('--datadir', default='./data')
     run.add_argument('--storedir', default='./checkpoints')
-    run.add_argument('--log_smooth', default=0.5)
+    add_argument(run, 'log_smooth', 0.5, 'logging smoothness parameter')
+    add_argument(test, 'adv_epsilon', 1., 'magnitude of adversarial perturbation')
+    add_argument(test, 'adv_norm', 'infty', 'norm of adversarial perturbation', \
+                 ['abs', 'l2','infty'])
+                      
     parser.set_defaults(**kwargs)
     try:
         if get_ipython().__class__.__name__ == 'ZMQInteractiveShell':
@@ -137,31 +153,26 @@ def train(state, args, models, device, loader, optimizers, logger):
         
         optimizers[1].step()
         
-        if batch_idx % args.log_interval == 0:
-            pass
-#            print('train epoch: {} [{}/{} ({:.0f}%)]\tloss: {:.6f} norm(delta): {}'.format(
-#                epoch, batch_idx * len(data), len(loader.dataset),
-#                100. * batch_idx / len(loader), loss.item(), perturb_norm))
-
         f1_smooth = (1-args.log_smooth)*f1_smooth + args.log_smooth*f1
         f2_smooth = (1-args.log_smooth)*f2_smooth + args.log_smooth*f2
-       
-        desc = (f'{args.loop_msg} | Loss: {f1_smooth:6.3f},{f2_smooth:6.3f} | norm(delta):{perturb_norm:8.5f} ||')
+        
+        out = {'loss0':f1, 'loss1':f2, 'loss_sum':f1+f2, 'norm_delta':perturb_norm}
 
         if batch_idx % args.log_interval == 0:
-            logger.append(state['iter'], {'loss0':f1, 'loss1':f2, 'loss_sum':f1+f2, 'norm_delta':perturb_norm})
-        iterator.set_description(desc)
-        iterator.refresh()
+            logger.append(state['iter'], out)
+            desc = (f'{args.loop_msg} | Loss: {f1_smooth:6.3f},{f2_smooth:6.3f} | norm(delta):{perturb_norm:8.5f} ||')
+            iterator.set_description(desc)
+            iterator.refresh()
 
         state['iter'] += 1
 
-def test(state, model, device, test_loader, logger):
+def test(state, args, model, device, test_loader, logger):
     model.eval()
     test_loss = 0
     correct = 0
     with torch.no_grad():
         iterator = tqdm(enumerate(test_loader), total=len(test_loader))
-        for idx, (data, target) in iterator:
+        for idx, batch in iterator:
             data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
@@ -172,20 +183,46 @@ def test(state, model, device, test_loader, logger):
             iterator.refresh()
 
     test_loss /= len(test_loader.dataset)
-    logger.append(state['iter'], {'test_accuracy': correct/len(test_loader.dataset)})
+    out = {'test_accuracy': correct/len(test_loader.dataset)}
+    logger.append(state['iter'], out)
+    return out
    
 class Logger():
-    def __init__(self, writer):
+    def __init__(self, writer=None):
         self.df = pandas.DataFrame()
         self.writer = writer
 
     def append(self, iter, other):
-        self.df.append(other, ignore_index=True)
-        for arg,val in other.items():
-            self.writer.add_scalar(arg, val, iter)
+        self.df = self.df.append(other, ignore_index=True)
+        if self.writer:
+            for arg,val in other.items():
+                self.writer.add_scalar(arg, val, iter)
     def to_pickle(self, path):
         self.df.to_pickle(path)
 
+def eval(exp_dir, epoch):
+    with open(os.path.join(exp_dir, 'args.txt'), 'r') as f:
+        kwargs = literal_eval(f.readline())
+        args = config(**kwargs)
+    logger = Logger()
+    print(f"lr1={args.lr1} lr2={args.lr2}")
+    (train_loader, test_loader), device = load(args)
+    models, optimizers = init(args, device, shape=train_loader.shape)
+    state = {"iter": np.nan}
+    save_model = os.path.join(exp_dir, f'save{epoch:03d}.pt')
+    save_perturb = os.path.join(exp_dir, f'save_perturb{epoch:03d}.pt')
+    out = {}
+    try:
+        models[0].load_state_dict(torch.load(save_model))
+        models[1].load_state_dict(torch.load(save_perturb))
+        out = test(state, args, models[0], device, test_loader, logger)
+        delta = [_ for _ in models[1].parameters()][0]
+        img = torchvision.utils.make_grid(delta, normalize=True)
+        torchvision.utils.save_image(img, os.path.join(exp_dir, f'perturb{epoch:03d}.png'))
+    except:
+        print("model not found")
+    return dict(lr1=args.lr1, lr2=args.lr2, **out)
+    
 
 def main(exp_id=None):
     state = dict(iter=0, start_time=time.time())
@@ -196,22 +233,18 @@ def main(exp_id=None):
         exp_id = str(uuid4())
 
     # try to make the store dir (if it doesn't exist)
-    storefile = os.path.join(args.storedir, exp_id)
+    exp_dir = os.path.join(args.storedir, exp_id)
     try:
-        os.makedirs(storefile)
+        os.makedirs(exp_dir)
     except OSError as e:
         print("Directory exists ({e.message})")
 
-    writer = SummaryWriter(storefile)
+    writer = SummaryWriter(exp_dir)
     logger = Logger(writer)
-    with open(os.path.join(storefile, 'args.txt'), 'w') as file:
+    with open(os.path.join(exp_dir, 'args.txt'), 'w') as file:
         file.write(str(vars(args)))
 
-    use_cuda = not args.no_cuda and torch.cuda.is_available()
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if use_cuda else "cpu")
-    kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
-    train_loader, test_loader = load(args.dataset, args.datadir, args.batch_size, args.test_batch_size, **kwargs)
+    (train_loader, test_loader), device = load(args) 
     models, optimizers = init(args, device, shape=train_loader.shape)
     sched1 = StepLR(optimizers[0], step_size=1, gamma=args.gamma1)
     sched2 = StepLR(optimizers[1], step_size=1, gamma=args.gamma2)
@@ -219,13 +252,14 @@ def main(exp_id=None):
     for epoch in range(1, args.epochs + 1):
         args.loop_msg = f'Epoch: {epoch}'
         train(state, args, models, device, train_loader, optimizers, logger)
-        test(state, models[0], device, test_loader, logger)
+        test(state, args, models[0], device, test_loader, logger)
         schedulers[0].step()
         schedulers[1].step()
         logger.to_pickle(os.path.join(args.storedir, exp_id, 'store.pkl'))
 
         if args.save_model:
-            torch.save(models[0].state_dict(), os.path.join(storefile, "save{epoch:03d}.pt"))
+            torch.save(models[0].state_dict(), os.path.join(exp_dir, f"save{epoch:03d}.pt"))
+            torch.save(models[1].state_dict(), os.path.join(exp_dir, f"save_perturb{epoch:03d}.pt"))
 
 
 if __name__ == '__main__':
