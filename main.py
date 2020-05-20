@@ -11,6 +11,7 @@ import pandas
 import sys
 from ast import literal_eval
 import numpy as np
+from torch import autograd
 
 import os
 from tensorboardX import SummaryWriter
@@ -18,6 +19,7 @@ from tensorboardX import SummaryWriter
 from uuid import uuid4
 
 from tqdm.auto import tqdm
+from helpers import add_argument
 
 class Net(nn.Module):
     """ default pytorch example """
@@ -56,56 +58,37 @@ class Perturb(nn.Module):
 
 def config(**kwargs):
     # Training settings
-    def add_argument(parser, desc, default, help_str, 
-                     arg_type=None, metavar=None, choices=None):
-        """ adds argument to argparse.ArugmentParser """
-        desc = desc.replace("_", '-')
-        if arg_type is None:
-            arg_type = type(default)
-        elif type(arg_type) is list:
-            choices = arg_type
-            arg_type = type(arg_type[0])
-        parser.add_argument('--'+desc, type=arg_type, default=default, metavar=metavar,
-                help=help_str, choices=choices)
-        return parser
-        
     parser = argparse.ArgumentParser(description='learning in games')
     train = parser.add_argument_group('train')
     test = parser.add_argument_group('test')
     run = parser.add_argument_group('run')
-    train.add_argument('--seed', type=int, default=1, metavar='S',
-                        help='random seed (default: 1)')
-    train.add_argument('--dataset', default='mnist')
-    train.add_argument('--batch-size', type=int, default=64, metavar='N',
-                        help='input batch size for training (default: 64)')
-    test.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
-                        help='input batch size for testing (default: 1000)')
-    train.add_argument('--epochs', type=int, default=14, metavar='N',
-                        help='number of epochs to train (default: 14)')
-    train.add_argument('--lr1', type=float, default=1.0, metavar='LR',
-                        help='learning rate (player 1)')
-    train.add_argument('--gamma1', type=float, default=0.7, metavar='M',
-                        help='Learning rate step gamma (player 1)')
-    train.add_argument('--lr2', type=float, default=1.0, metavar='LR',
-                        help='learning rate (player 2)')
-    train.add_argument('--gamma2', type=float, default=0.7, metavar='M',
-                        help='Learning rate step gamma (player 2)')
-    train.add_argument('--perturb_reg', type=float, default=0.0)
-    run.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
-    run.add_argument('--log-interval', type=int, default=10, metavar='N',
-                        help='how many batches to wait before logging training status')
-    run.add_argument('--save-model', action='store_true', default=True,
-                        help='For Saving the current Model')
-    run.add_argument('--datadir', default='./data')
-    run.add_argument('--storedir', default='./checkpoints')
-    add_argument(run, 'log_smooth', 0.5, 'logging smoothness parameter')
-    add_argument(test, 'adv_epsilon', 1., 'magnitude of adversarial perturbation')
-    add_argument(test, 'adv_norm', 'infty', 'norm of adversarial perturbation', \
-                 ['abs', 'l2','infty'])
+
+    add_argument(train, 'seed', 1,         'random seed', 'S')
+    add_argument(train, 'dataset',         'mnist')
+    add_argument(train, 'batch_size',       64, 'input batch size for training', 'N')
+    add_argument(train, 'test_batch_size',  1000, 'input batch size for testing', 'N')
+    add_argument(train, 'epochs',           20, 'number of epochs to train', 'N')
+    add_argument(train, 'lr1',              1.0, 'learning rate for classifier', 'LR')
+    add_argument(train, 'lr2',              1.0, 'learning rate for adversary', 'LR')
+    add_argument(train, 'gamma1',           0.7, 'learning rate step gamma (per epoch)', 'M')
+    add_argument(train, 'gamma2',           0.7, 'learning rate step gamma (per epoch)', 'M')
+    add_argument(train, 'perturb_reg',      0.0, 'regularization on adversarial perturbation', 'REG')
+
+    add_argument(run, 'no_cuda',            False, 'disables CUDA training')
+    add_argument(run, 'save_model',         True, 'For Saving the current Model')
+    add_argument(run, 'log_interval',       10, 'how many batches to wait before logging training status', 'N')
+    add_argument(run, 'datadir',           'data')
+    add_argument(run, 'storedir',          'checkpoints')
+#    add_argument(run, 'resume_epoch',       1, 'Epoch to resume running at')
+    add_argument(run, 'log_smooth',         0.5, 'logging smoothness parameter')
+
+    add_argument(test, 'adv_epsilon',       1., 'magnitude of adversarial perturbation')
+    add_argument(test, 'adv_norm',         'inf', 'norm of adversarial perturbation', \
+                 choices=['abs', 'l2','inf'])
                       
     parser.set_defaults(**kwargs)
     try:
+        # hack for detecting a jupyter lab notebook
         if get_ipython().__class__.__name__ == 'ZMQInteractiveShell':
             args = parser.parse_args('')
     except:        
@@ -135,6 +118,7 @@ def train(state, args, models, device, loader, optimizers, logger):
     f2_smooth = 0
     for batch_idx, (data, target) in iterator:
         batch = data.to(device), target.to(device)
+        data, target = batch
         
         optimizers[0].zero_grad()
         
@@ -172,7 +156,7 @@ def test(state, args, model, device, test_loader, logger):
     correct = 0
     with torch.no_grad():
         iterator = tqdm(enumerate(test_loader), total=len(test_loader))
-        for idx, batch in iterator:
+        for idx, (data, target) in iterator:
             data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
@@ -185,6 +169,46 @@ def test(state, args, model, device, test_loader, logger):
     test_loss /= len(test_loader.dataset)
     out = {'test_accuracy': correct/len(test_loader.dataset)}
     logger.append(state['iter'], out)
+    return out
+
+def test_adv(state, args, model, device, test_loader, logger=None):
+    model.eval()
+    
+    iterator = tqdm(enumerate(test_loader), total=len(test_loader))
+    correct = 0
+    adv_correct = 0
+    for idx, (data, target) in iterator:
+        data, target = data.to(device), target.to(device)
+        perturb = torch.tensor(torch.zeros(*test_loader.shape), requires_grad=True, device=device)
+        output = model(data + perturb)
+        loss = F.nll_loss(output, target)
+        pred = output.argmax(dim=1, keepdim=True)
+        correct += pred.eq(target.view_as(pred)).sum().item()
+
+        Dperturb_loss = autograd.grad(loss, perturb)[0]
+        
+        if args.adv_norm == 'infty':
+            Dperturb_loss = torch.sign(Dperturb_loss)
+        elif args.adv_norm == 'l2':
+            Dperturb_loss *= torch.norm(torch.ones(*Dperturb_loss.shape))
+            Dperturb_loss /= torch.norm(Dperturb_loss)
+        elif args.adv_norm == 'noise':
+            Dperturb_loss = torch.rand_like(Dperturb_loss) 
+        else:
+            raise NotImplemented()
+        
+        adv_data = data + args.adv_epsilon*Dperturb_loss
+        adv_output = model(adv_data)
+        adv_pred = adv_output.argmax(dim=1, keepdim=True)
+        adv_correct += adv_pred.eq(target.view_as(adv_pred)).sum().item()
+        
+        desc = (f'Test (adv) | Loss: {loss:10.3f}, {correct}/{len(test_loader.dataset)})')
+        iterator.set_description(desc)
+
+    accuracy = correct/len(test_loader.dataset)
+    adv_accuracy = adv_correct/len(test_loader.dataset)
+    out = {'test_accuracy': accuracy, 'adv_accuracy': adv_accuracy, 'adv_data': adv_data}
+    if logger: logger.append(state['iter'], out)
     return out
    
 class Logger():
@@ -224,13 +248,9 @@ def eval(exp_dir, epoch):
     return dict(lr1=args.lr1, lr2=args.lr2, **out)
     
 
-def main(exp_id=None):
+def main(exp_id=str(uuid4())):
     state = dict(iter=0, start_time=time.time())
-    args = config()
-
-    # make a new experiment id
-    if not exp_id:
-        exp_id = str(uuid4())
+    args = config(exp_id=exp_id)
 
     # try to make the store dir (if it doesn't exist)
     exp_dir = os.path.join(args.storedir, exp_id)
