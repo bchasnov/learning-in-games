@@ -16,8 +16,18 @@ def add_argument(parser, desc, default, help_str,
             help=help_str, choices=choices)
     return parser
 
+def save_dict(d, filename):
+    with open(filename, 'w') as f:
+        f.write(str(d))
+    
 def load_dict(filename):
+    """ """
     with open(filename) as f:
         kwargs = ast.literal_eval(f.readline())
     return kwargs
 
+
+def fstr(template, **kwargs):
+    """ Delay f-string evaluation. 
+    See https://stackoverflow.com/a/53671539 """
+    return eval(f"f'{template}'", kwargs)

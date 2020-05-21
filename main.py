@@ -19,7 +19,8 @@ from tensorboardX import SummaryWriter
 from uuid import uuid4
 
 from tqdm.auto import tqdm
-from helpers import add_argument
+from helpers import add_argument, fstr, save_dict
+import defaults
 
 class Net(nn.Module):
     """ default pytorch example """
@@ -63,23 +64,23 @@ def config(**kwargs):
     test = parser.add_argument_group('test')
     run = parser.add_argument_group('run')
 
-    add_argument(train, 'seed', 1,         'random seed', 'S')
-    add_argument(train, 'dataset',         'mnist')
+    add_argument(train, 'seed',             1, 'random seed', 'S')
+    add_argument(train, 'dataset',         'mnist', 'dataset', choices=['mnist'])
     add_argument(train, 'batch_size',       64, 'input batch size for training', 'N')
     add_argument(train, 'test_batch_size',  1000, 'input batch size for testing', 'N')
     add_argument(train, 'epochs',           20, 'number of epochs to train', 'N')
-    add_argument(train, 'lr1',              1.0, 'learning rate for classifier', 'LR')
-    add_argument(train, 'lr2',              1.0, 'learning rate for adversary', 'LR')
+    add_argument(train, 'lr1',              0.1, 'learning rate for classifier', 'LR')
+    add_argument(train, 'lr2',              10.0, 'learning rate for adversary', 'LR')
     add_argument(train, 'gamma1',           0.7, 'learning rate step gamma (per epoch)', 'M')
     add_argument(train, 'gamma2',           0.7, 'learning rate step gamma (per epoch)', 'M')
-    add_argument(train, 'perturb_reg',      0.0, 'regularization on adversarial perturbation', 'REG')
+    add_argument(train, 'perturb_reg',      0.000001, 'regularization on adversarial perturbation', 'REG')
 
     add_argument(run, 'no_cuda',            False, 'disables CUDA training')
     add_argument(run, 'save_model',         True, 'For Saving the current Model')
     add_argument(run, 'log_interval',       10, 'how many batches to wait before logging training status', 'N')
-    add_argument(run, 'datadir',           'data')
-    add_argument(run, 'storedir',          'checkpoints')
-#    add_argument(run, 'resume_epoch',       1, 'Epoch to resume running at')
+    add_argument(run, 'datadir',           'data', 'directory of dataset')
+    add_argument(run, 'storedir',           defaults.STORE_DIR, 'directory to store checkpoints')
+    add_argument(run, 'epoch',              1, 'Epoch to resume running at')
     add_argument(run, 'log_smooth',         0.5, 'logging smoothness parameter')
 
     add_argument(test, 'adv_epsilon',       1., 'magnitude of adversarial perturbation')
@@ -94,7 +95,6 @@ def config(**kwargs):
     except:        
         args = parser.parse_args()
     return args
-
 
 def init(args, device, shape):
     model = Net().to(device)
@@ -171,7 +171,7 @@ def test(state, args, model, device, test_loader, logger):
     logger.append(state['iter'], out)
     return out
 
-def test_adv(state, args, model, device, test_loader, logger=None):
+def test_adv(state, args, model, device, test_loader, logger=None, loop_msg='Adversarial Test'):
     model.eval()
     
     iterator = tqdm(enumerate(test_loader), total=len(test_loader))
@@ -261,8 +261,6 @@ def main(exp_id=str(uuid4())):
 
     writer = SummaryWriter(exp_dir)
     logger = Logger(writer)
-    with open(os.path.join(exp_dir, 'args.txt'), 'w') as file:
-        file.write(str(vars(args)))
 
     (train_loader, test_loader), device = load(args) 
     models, optimizers = init(args, device, shape=train_loader.shape)
@@ -270,7 +268,8 @@ def main(exp_id=str(uuid4())):
     sched2 = StepLR(optimizers[1], step_size=1, gamma=args.gamma2)
     schedulers = [sched1, sched2]
     for epoch in range(1, args.epochs + 1):
-        args.loop_msg = f'Epoch: {epoch}'
+        args.epoch = epoch
+        args.loop_msg = fstr(defaults.LOOP_MSG, args=args)
         train(state, args, models, device, train_loader, optimizers, logger)
         test(state, args, models[0], device, test_loader, logger)
         schedulers[0].step()
@@ -278,8 +277,9 @@ def main(exp_id=str(uuid4())):
         logger.to_pickle(os.path.join(args.storedir, exp_id, 'store.pkl'))
 
         if args.save_model:
-            torch.save(models[0].state_dict(), os.path.join(exp_dir, f"save{epoch:03d}.pt"))
-            torch.save(models[1].state_dict(), os.path.join(exp_dir, f"save_perturb{epoch:03d}.pt"))
+            for model, savefile in zip(models, defaults.SAVE_FILES):
+                torch.save(model.state_dict(), os.path.join(exp_dir, fstr(savefile, args=args)))
+            save_dict(vars(args), os.path.join(exp_dir, defaults.ARG_FILE))
 
 
 if __name__ == '__main__':
