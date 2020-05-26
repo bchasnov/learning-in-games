@@ -59,7 +59,7 @@ for exp_name, exp_dir in zip(exp_names, exp_dirs):
     kwargs = load_dict(os.path.join(exp_dir, defaults.ARG_FILE))
     args = main.config(**kwargs)
     (train_loader, test_loader), device = main.load(args)
-    models, _ = main.init(args, device, shape=train_loader.shape)
+    models, _, _= main.init(args, device, shape=train_loader.shape)
 
     checkpoints = [os.path.join(exp_dir, fstr(f, args=args))
         for f in defaults.SAVE_FILES]

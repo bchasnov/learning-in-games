@@ -66,13 +66,15 @@ def config(**kwargs):
 
     add_argument(train, 'seed',             1, 'random seed', 'S')
     add_argument(train, 'dataset',         'mnist', 'dataset', choices=['mnist'])
-    add_argument(train, 'batch_size',       64, 'input batch size for training', 'N')
+    add_argument(train, 'batch_size',       200, 'input batch size for training', 'N')
     add_argument(train, 'test_batch_size',  1000, 'input batch size for testing', 'N')
     add_argument(train, 'epochs',           20, 'number of epochs to train', 'N')
-    add_argument(train, 'lr1',              0.1, 'learning rate for classifier', 'LR')
-    add_argument(train, 'lr2',              10.0, 'learning rate for adversary', 'LR')
-    add_argument(train, 'gamma1',           0.7, 'learning rate step gamma (per epoch)', 'M')
-    add_argument(train, 'gamma2',           0.7, 'learning rate step gamma (per epoch)', 'M')
+    add_argument(train, 'lr1',              0.2, 'learning rate for classifier', 'LR')
+    add_argument(train, 'lr2',              1.0, 'learning rate for adversary', 'LR')
+    add_argument(train, 'lr_rate1',         1e-5, 'learning rate decay const for classifier', 'M')
+    add_argument(train, 'lr_class1',       '1/t', 'learning rate decay function', 'FN', choices=['1/t','1/tlogt'] )
+    add_argument(train, 'lr_rate2',         3e-6, 'learning rate decay const for adversary', 'M')
+    add_argument(train, 'lr_class2',       '1/tlogt', 'learning rate decay function', 'FN', choices=['1/t','1/tlogt'] )
     add_argument(train, 'perturb_reg',      0.000001, 'regularization on adversarial perturbation', 'REG')
 
     add_argument(run, 'no_cuda',            False, 'disables CUDA training')
@@ -82,6 +84,7 @@ def config(**kwargs):
     add_argument(run, 'storedir',           defaults.STORE_DIR, 'directory to store checkpoints')
     add_argument(run, 'epoch',              1, 'Epoch to resume running at')
     add_argument(run, 'log_smooth',         0.5, 'logging smoothness parameter')
+    add_argument(run, 'last_iter',          -1, 'Last iteration')
 
     add_argument(test, 'adv_epsilon',       1., 'magnitude of adversarial perturbation')
     add_argument(test, 'adv_norm',         'inf', 'norm of adversarial perturbation', \
@@ -96,19 +99,31 @@ def config(**kwargs):
         args = parser.parse_args()
     return args
 
-def init(args, device, shape):
+def init(args, device, shape, last_iter=-1):
     model = Net().to(device)
     perturb = Perturb(shape).to(device) 
-    opt1 = optim.SGD(model.parameters(), lr=args.lr1)
+
+    def lr(t, mode='1/t'):
+        if mode == '1/t': return t
+        elif mode == '1/tlogt': return t*np.log(t+1)
+        else: raise NotImplemented
+            
+    opt1 = optim.SGD(model.parameters(), lr=args.lr1 )
+    lr1 = lambda t: args.lr1/(args.lr_rate1*lr(t, mode=args.lr_class1) + 1)
+    sch1 = optim.lr_scheduler.LambdaLR(opt1, lr1, last_epoch=-1)#args.last_iter)
+
     opt2 = optim.SGD(perturb.parameters(), lr=args.lr2)
-    return (model, perturb), (opt1, opt2)
+    lr2 = lambda t: args.lr2/(args.lr_rate2*lr(t, mode=args.lr_class2) + 1)
+    sch2 = optim.lr_scheduler.LambdaLR(opt2, lr2, last_epoch=-1)#args.last_iter)
+
+    return (model, perturb), (opt1, opt2), (sch1, sch2)
 
 def loss(model, delta, batch):
     (data, target) = batch
     output = model(data + delta)
     return F.nll_loss(output, target)
 
-def train(state, args, models, device, loader, optimizers, logger):
+def train(state, args, models, device, loader, optimizers, schedulers, logger):
     model, perturb = models
     model.train()
     
@@ -148,6 +163,8 @@ def train(state, args, models, device, loader, optimizers, logger):
             iterator.set_description(desc)
             iterator.refresh()
 
+        schedulers[0].step()
+        schedulers[1].step()
         state['iter'] += 1
 
 def test(state, args, model, device, test_loader, logger):
@@ -190,8 +207,8 @@ def test_adv(state, args, model, device, test_loader, logger=None, loop_msg='Adv
         if args.adv_norm == 'infty':
             Dperturb_loss = torch.sign(Dperturb_loss)
         elif args.adv_norm == 'l2':
-            Dperturb_loss *= torch.norm(torch.ones(*Dperturb_loss.shape))
             Dperturb_loss /= torch.norm(Dperturb_loss)
+            Dperturb_loss *= torch.norm(torch.ones(*Dperturb_loss.shape))
         elif args.adv_norm == 'noise':
             Dperturb_loss = torch.rand_like(Dperturb_loss) 
         else:
@@ -202,7 +219,7 @@ def test_adv(state, args, model, device, test_loader, logger=None, loop_msg='Adv
         adv_pred = adv_output.argmax(dim=1, keepdim=True)
         adv_correct += adv_pred.eq(target.view_as(adv_pred)).sum().item()
         
-        desc = (f'Test (adv) | Loss: {loss:10.3f}, {correct}/{len(test_loader.dataset)})')
+        desc = (f'Test ({args.adv_epsilon:.2f}-{args.adv_norm}) | Loss: {loss:8.3f}, {adv_correct}/{len(test_loader.dataset)}')
         iterator.set_description(desc)
 
     accuracy = correct/len(test_loader.dataset)
@@ -263,19 +280,17 @@ def main(exp_id=str(uuid4())):
     logger = Logger(writer)
 
     (train_loader, test_loader), device = load(args) 
-    models, optimizers = init(args, device, shape=train_loader.shape)
-    sched1 = StepLR(optimizers[0], step_size=1, gamma=args.gamma1)
-    sched2 = StepLR(optimizers[1], step_size=1, gamma=args.gamma2)
-    schedulers = [sched1, sched2]
+    models, optimizers, schedulers = init(args, device, shape=train_loader.shape, last_iter=args.last_iter)
+
     for epoch in range(1, args.epochs + 1):
         args.epoch = epoch
+        args.last_iter = epoch*len(train_loader)
         args.loop_msg = fstr(defaults.LOOP_MSG, args=args)
-        train(state, args, models, device, train_loader, optimizers, logger)
-        test(state, args, models[0], device, test_loader, logger)
-        schedulers[0].step()
-        schedulers[1].step()
-        logger.to_pickle(os.path.join(args.storedir, exp_id, 'store.pkl'))
 
+        train(state, args, models, device, train_loader, optimizers, schedulers, logger)
+        test(state, args, models[0], device, test_loader, logger)
+
+        logger.to_pickle(os.path.join(args.storedir, exp_id, 'store.pkl'))
         if args.save_model:
             for model, savefile in zip(models, defaults.SAVE_FILES):
                 torch.save(model.state_dict(), os.path.join(exp_dir, fstr(savefile, args=args)))
