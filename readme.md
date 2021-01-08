@@ -1,15 +1,33 @@
 ## Introduction
 
-A game is a collection of *costs* (or *rewards*) of *n* agents. 
+A game is a collection of `n` *costs* (or *rewards*)
+that agents try to *minimize* (or *maximize*).
 These costs map from the space of all of the *actions* of the agents to a scalar value. 
-Agents try to *minimize* (or *maximize*) this value.
 
-We design and analyze learning algorithms that compute an equilibrium of the costs. 
+We design and analyze learning algorithms that compute the equilibrium of the costs. 
 These algorithms are based on the local first- and second-order gradients of the costs.
 
 There are several equilibrium concepts that are significant in games. One equilibrium is where all agents are individually at a *local minimum* (or *maximum*). Another is when an agents is at a local optimum given that the other agent will perform optimally.
 These equilibria can be verified with the second order derivatives of the costs and the Schur complement of the game Jacobian.
 
+
+## Installation
+Make sure to run the package in its own environment for testing.
+Install using poetry:
+```
+cd learning-in-games
+poetry install
+```
+
+Run python notebooks:
+```
+poetry run jupyter notebooks
+```
+
+Run tests:
+```
+poetry run python tests.py
+```
 
 ## Formulation
 Concretely, an `n`-player game denoted by `G = (f1, f2, ..., fn)` where 
@@ -49,6 +67,4 @@ We start with `n = 2`.
 
 ### Single player games
 As a benchmark, we try to always include a single player scenario (optimization problems, LQR, classification, regression, etc).
-
-## Installation
 
